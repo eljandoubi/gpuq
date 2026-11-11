@@ -42,10 +42,22 @@ type Config struct {
 	// GPUs are idle (borrowing); borrowed GPUs are reclaimed by preemption when another team needs
 	// its own share back. Teams without an entry have no guarantee.
 	Quota map[string]int
+	// Preempt allows FairShare to preempt preemptible jobs. The rules are in canPreempt: a team
+	// within its quota never loses a job to another team, and only the head of the queue and the
+	// queued jobs that fit their team's quota may start a preemption.
+	Preempt bool
 	// LookAhead bounds how many pending jobs are examined for backfill (default 256).
 	LookAhead int
 	// HalfLife is the half-life in seconds of the usage decay used for fairness (default 6h).
 	HalfLife float64
+	// MinRun is how long a job must have been running before it can be preempted (default 300 s,
+	// like Slurm's PreemptExemptTime). It also makes every Tick terminate: a job started or
+	// restarted during a Tick has run for zero seconds, so it cannot be preempted in that Tick.
+	MinRun float64
+	// RestartCost is the time in seconds, per GPU, that a preempted job spends restarting
+	// (scheduling, process start, checkpoint load) on top of the work it lost since its last
+	// checkpoint (default 120 s). It is added to the job's remaining time and to the wasted GPU-time.
+	RestartCost float64
 }
 
 // EventKind tells what happened to a job.
@@ -96,6 +108,12 @@ func New(cfg Config, cl *model.Cluster) *Scheduler {
 	}
 	if cfg.HalfLife <= 0 {
 		cfg.HalfLife = 6 * 3600
+	}
+	if cfg.MinRun <= 0 {
+		cfg.MinRun = 300
+	}
+	if cfg.RestartCost <= 0 {
+		cfg.RestartCost = 120
 	}
 	return &Scheduler{
 		cfg:      cfg,
@@ -277,6 +295,22 @@ func (s *Scheduler) step(now float64) bool {
 		return false
 	}
 	limit := min(len(q), 1+s.cfg.LookAhead)
+	if s.cfg.Kind == FairShare && s.cfg.Preempt {
+		// The head may preempt, and so may any queued job that fits its team's quota: getting a
+		// guaranteed share back must not wait for the jobs ahead, which may be over quota.
+		run := s.RunningByTeam()
+		for i, j := range q[:limit] {
+			if i > 0 && run[j.Team]+j.GPUs() > s.cfg.Quota[j.Team] {
+				continue
+			}
+			if s.preemptFor(j, now, run) {
+				if !s.tryStart(j, now) {
+					panic(fmt.Sprintf("job %d does not fit after its victims were preempted", j.ID))
+				}
+				return true
+			}
+		}
+	}
 	shadow := s.shadow(head)
 	if _, seen := s.reserved[head.ID]; !seen {
 		s.reserved[head.ID] = shadow
