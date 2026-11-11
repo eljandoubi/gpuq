@@ -38,8 +38,14 @@ func (k Kind) String() string {
 // Config tunes the scheduler.
 type Config struct {
 	Kind Kind
+	// Quota is the number of GPUs each team is guaranteed. A team may run above its quota when
+	// GPUs are idle (borrowing); borrowed GPUs are reclaimed by preemption when another team needs
+	// its own share back. Teams without an entry have no guarantee.
+	Quota map[string]int
 	// LookAhead bounds how many pending jobs are examined for backfill (default 256).
 	LookAhead int
+	// HalfLife is the half-life in seconds of the usage decay used for fairness (default 6h).
+	HalfLife float64
 }
 
 // EventKind tells what happened to a job.
@@ -76,6 +82,8 @@ type Scheduler struct {
 	cl       *model.Cluster
 	pending  []*model.Job
 	running  map[int]*model.Job
+	usage    map[string]float64
+	lastTick float64
 	events   []Event
 	reserved map[int]float64
 	Stats    Stats
@@ -86,10 +94,14 @@ func New(cfg Config, cl *model.Cluster) *Scheduler {
 	if cfg.LookAhead <= 0 {
 		cfg.LookAhead = 256
 	}
+	if cfg.HalfLife <= 0 {
+		cfg.HalfLife = 6 * 3600
+	}
 	return &Scheduler{
 		cfg:      cfg,
 		cl:       cl,
 		running:  map[int]*model.Job{},
+		usage:    map[string]float64{},
 		reserved: map[int]float64{},
 	}
 }
@@ -152,6 +164,7 @@ func (s *Scheduler) Complete(id int, now float64) error {
 	if !ok {
 		return fmt.Errorf("job %d is not running", id)
 	}
+	s.accrue(now)
 	if err := s.cl.Release(r.Placement); err != nil {
 		return err
 	}
@@ -165,6 +178,7 @@ func (s *Scheduler) Complete(id int, now float64) error {
 
 // Tick starts every job the policy allows at time now.
 func (s *Scheduler) Tick(now float64) {
+	s.accrue(now)
 	for s.step(now) {
 	}
 }
@@ -192,11 +206,69 @@ func (s *Scheduler) removePending(j *model.Job) {
 	}
 }
 
+// accrue integrates GPU usage per team with exponential decay (fair-share accounting).
+func (s *Scheduler) accrue(now float64) {
+	dt := now - s.lastTick
+	if dt <= 0 {
+		return
+	}
+	decay := math.Pow(0.5, dt/s.cfg.HalfLife)
+	for t := range s.usage {
+		s.usage[t] *= decay
+	}
+	for _, r := range s.running {
+		s.usage[r.Team] += float64(r.GPUs()) * dt
+	}
+	s.lastTick = now
+}
+
+// ordered returns the pending jobs in the order the policy wants to serve them. FairShare puts the
+// jobs that fit their team's quota first, then orders by priority, then by decayed usage divided by
+// quota (the team that has used the least of its share goes first), then by arrival.
+func (s *Scheduler) ordered() []*model.Job {
+	q := append([]*model.Job(nil), s.pending...)
+	if s.cfg.Kind != FairShare {
+		return q
+	}
+	run := s.RunningByTeam()
+	type ranked struct {
+		j    *model.Job
+		over bool
+		norm float64
+	}
+	r := make([]ranked, len(q))
+	for i, j := range q {
+		quota := float64(s.cfg.Quota[j.Team])
+		r[i] = ranked{
+			j:    j,
+			over: run[j.Team]+j.GPUs() > s.cfg.Quota[j.Team],
+			norm: s.usage[j.Team] / math.Max(1, quota),
+		}
+	}
+	sort.Slice(r, func(a, b int) bool {
+		x, y := r[a], r[b]
+		if x.over != y.over {
+			return !x.over
+		}
+		if x.j.Priority != y.j.Priority {
+			return x.j.Priority > y.j.Priority
+		}
+		if x.norm != y.norm {
+			return x.norm < y.norm
+		}
+		return s.less(x.j, y.j)
+	})
+	for i := range r {
+		q[i] = r[i].j
+	}
+	return q
+}
+
 func (s *Scheduler) step(now float64) bool {
 	if len(s.pending) == 0 {
 		return false
 	}
-	q := append([]*model.Job(nil), s.pending...)
+	q := s.ordered()
 	head := q[0]
 	if s.tryStart(head, now) {
 		return true
@@ -204,11 +276,11 @@ func (s *Scheduler) step(now float64) bool {
 	if s.cfg.Kind == FIFO {
 		return false
 	}
+	limit := min(len(q), 1+s.cfg.LookAhead)
 	shadow := s.shadow(head)
 	if _, seen := s.reserved[head.ID]; !seen {
 		s.reserved[head.ID] = shadow
 	}
-	limit := min(len(q), 1+s.cfg.LookAhead)
 	for _, j := range q[1:limit] {
 		if now+j.Remaining <= shadow+1e-9 && s.tryStart(j, now) {
 			return true

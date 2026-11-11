@@ -90,6 +90,32 @@ func TestBackfillRefusesAJobThatWouldDelayTheHead(t *testing.T) {
 	}
 }
 
+func TestFairShareServesTheJobWithinQuotaFirst(t *testing.T) {
+	s := sched.New(sched.Config{Kind: sched.FairShare, Quota: map[string]int{"a": 4}}, cluster(1, 4))
+	j1, j2, j3 := job(1, "a", 1, 4, 100), job(2, "b", 1, 4, 100), job(3, "a", 1, 4, 100)
+	submit(t, s, 0, j1)
+	submit(t, s, 1, j2) // team b has no quota
+	submit(t, s, 2, j3)
+	complete(t, s, 1, 100)
+	if j3.State != model.Running || j2.State != model.Pending {
+		t.Fatalf("j3=%v j2=%v: team a is back within its quota and goes before team b, which arrived first",
+			j3.State, j2.State)
+	}
+}
+
+func TestFairShareFavoursTheTeamThatUsedLess(t *testing.T) {
+	s := sched.New(sched.Config{Kind: sched.FairShare, Quota: map[string]int{"a": 4, "b": 4}}, cluster(1, 4))
+	j1, j2, j3 := job(1, "a", 1, 4, 1000), job(2, "a", 1, 4, 100), job(3, "b", 1, 4, 100)
+	submit(t, s, 0, j1)
+	submit(t, s, 10, j2)
+	submit(t, s, 20, j3)
+	complete(t, s, 1, 1000)
+	if j3.State != model.Running || j2.State != model.Pending {
+		t.Fatalf("j3=%v j2=%v: both teams are within quota, team a ran for 1000 s and team b not at all",
+			j3.State, j2.State)
+	}
+}
+
 func TestRunningByTeamAndRunningJobs(t *testing.T) {
 	s := sched.New(sched.Config{Kind: sched.Backfill}, cluster(2, 4))
 	submit(t, s, 0, job(1, "a", 1, 4, 10), job(2, "b", 1, 2, 10))
