@@ -64,6 +64,32 @@ func TestFIFOBlocksBehindTheHead(t *testing.T) {
 	}
 }
 
+func TestBackfillStartsAShortJobWithoutDelayingTheHead(t *testing.T) {
+	s := sched.New(sched.Config{Kind: sched.Backfill}, cluster(2, 4))
+	j2 := job(2, "a", 2, 4, 50)
+	submit(t, s, 0, job(1, "a", 1, 4, 100), j2, job(3, "a", 1, 4, 10))
+	if s.Running() != 2 {
+		t.Fatalf("running=%d, want 2: job 3 ends before job 2 could start, so it may run now", s.Running())
+	}
+	if at, ok := s.Reserved(2); !ok || at != 100 {
+		t.Fatalf("job 2 was promised %v (%v), want 100", at, ok)
+	}
+	complete(t, s, 3, 10)
+	complete(t, s, 1, 100)
+	if j2.State != model.Running || j2.Start != 100 {
+		t.Fatalf("job 2: state=%v start=%v, want it started at its reserved time 100", j2.State, j2.Start)
+	}
+}
+
+func TestBackfillRefusesAJobThatWouldDelayTheHead(t *testing.T) {
+	s := sched.New(sched.Config{Kind: sched.Backfill}, cluster(2, 4))
+	j3 := job(3, "a", 1, 4, 500)
+	submit(t, s, 0, job(1, "a", 1, 4, 100), job(2, "a", 2, 4, 50), j3)
+	if j3.State != model.Pending {
+		t.Fatalf("job 3 would hold a node until 500, past the head's reservation at 100: state=%v", j3.State)
+	}
+}
+
 func TestRunningByTeamAndRunningJobs(t *testing.T) {
 	s := sched.New(sched.Config{Kind: sched.Backfill}, cluster(2, 4))
 	submit(t, s, 0, job(1, "a", 1, 4, 10), job(2, "b", 1, 2, 10))

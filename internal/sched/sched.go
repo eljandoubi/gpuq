@@ -4,6 +4,7 @@ package sched
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/eljandoubi/gpuq/internal/model"
@@ -37,6 +38,8 @@ func (k Kind) String() string {
 // Config tunes the scheduler.
 type Config struct {
 	Kind Kind
+	// LookAhead bounds how many pending jobs are examined for backfill (default 256).
+	LookAhead int
 }
 
 // EventKind tells what happened to a job.
@@ -69,20 +72,25 @@ type Stats struct {
 
 // Scheduler owns the queue and the cluster state. It is not safe for concurrent use.
 type Scheduler struct {
-	cfg     Config
-	cl      *model.Cluster
-	pending []*model.Job
-	running map[int]*model.Job
-	events  []Event
-	Stats   Stats
+	cfg      Config
+	cl       *model.Cluster
+	pending  []*model.Job
+	running  map[int]*model.Job
+	events   []Event
+	reserved map[int]float64
+	Stats    Stats
 }
 
 // New returns a scheduler that allocates from cl.
 func New(cfg Config, cl *model.Cluster) *Scheduler {
+	if cfg.LookAhead <= 0 {
+		cfg.LookAhead = 256
+	}
 	return &Scheduler{
-		cfg:     cfg,
-		cl:      cl,
-		running: map[int]*model.Job{},
+		cfg:      cfg,
+		cl:       cl,
+		running:  map[int]*model.Job{},
+		reserved: map[int]float64{},
 	}
 }
 
@@ -111,6 +119,12 @@ func (s *Scheduler) RunningJobs() []*model.Job {
 		out = append(out, r)
 	}
 	return out
+}
+
+// Reserved returns the start time promised to a job while it was the head of the queue.
+func (s *Scheduler) Reserved(id int) (float64, bool) {
+	t, ok := s.reserved[id]
+	return t, ok
 }
 
 // Drain returns the events produced since the last call.
@@ -182,7 +196,25 @@ func (s *Scheduler) step(now float64) bool {
 	if len(s.pending) == 0 {
 		return false
 	}
-	return s.tryStart(s.pending[0], now)
+	q := append([]*model.Job(nil), s.pending...)
+	head := q[0]
+	if s.tryStart(head, now) {
+		return true
+	}
+	if s.cfg.Kind == FIFO {
+		return false
+	}
+	shadow := s.shadow(head)
+	if _, seen := s.reserved[head.ID]; !seen {
+		s.reserved[head.ID] = shadow
+	}
+	limit := min(len(q), 1+s.cfg.LookAhead)
+	for _, j := range q[1:limit] {
+		if now+j.Remaining <= shadow+1e-9 && s.tryStart(j, now) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scheduler) tryStart(j *model.Job, now float64) bool {
@@ -210,4 +242,29 @@ func (s *Scheduler) tryStart(j *model.Job, now float64) bool {
 	}
 	s.events = append(s.events, Event{Kind: Start, Job: j, Time: now, Gen: j.Gen, Remaining: j.Remaining})
 	return true
+}
+
+// shadow is the earliest time the head job could start if running jobs end as planned.
+func (s *Scheduler) shadow(head *model.Job) float64 {
+	trial := s.cl.Clone()
+	ends := make([]*model.Job, 0, len(s.running))
+	for _, r := range s.running {
+		ends = append(ends, r)
+	}
+	sort.Slice(ends, func(a, b int) bool {
+		ea, eb := ends[a].Start+ends[a].Remaining, ends[b].Start+ends[b].Remaining
+		if ea != eb {
+			return ea < eb
+		}
+		return ends[a].ID < ends[b].ID
+	})
+	for _, r := range ends {
+		if err := trial.Release(r.Placement); err != nil {
+			panic(err)
+		}
+		if _, _, ok := trial.Place(head.Nodes, head.GPUsPerNode); ok {
+			return r.Start + r.Remaining
+		}
+	}
+	return math.Inf(1)
 }
