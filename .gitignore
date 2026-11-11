@@ -1,0 +1,6 @@
+*.test
+*.out
+coverage.txt
+/gpuq-sim
+/gpuqd
+.DS_Store
