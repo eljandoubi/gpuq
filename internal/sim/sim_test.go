@@ -1,8 +1,10 @@
 package sim_test
 
 import (
+	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/eljandoubi/gpuq/internal/model"
@@ -11,6 +13,14 @@ import (
 )
 
 var spec = sim.Spec{Nodes: 8, GPUsPerNode: 8, NodesPerRack: 4}
+
+func quotas(teams []sim.TeamCfg) map[string]int {
+	q := map[string]int{}
+	for _, t := range teams {
+		q[t.Name] = t.Quota
+	}
+	return q
+}
 
 func workload(seed int64, jobs int, load float64) []*model.Job {
 	return sim.Generate(sim.WorkloadCfg{Seed: seed, Jobs: jobs, Load: load, Spec: spec})
@@ -106,6 +116,16 @@ func TestGenerateOffersTheRequestedLoadAndShares(t *testing.T) {
 	}
 }
 
+func TestRunIsDeterministic(t *testing.T) {
+	w := workload(5, 600, 0.9)
+	cfg := sched.Config{Kind: sched.FairShare, Quota: quotas(sim.DefaultTeams()), Preempt: true}
+	a, b := sim.Run(spec, cfg, w), sim.Run(spec, cfg, w)
+	a.DecisionP50us, a.DecisionP99us, b.DecisionP50us, b.DecisionP99us = 0, 0, 0, 0
+	if fmt.Sprint(a) != fmt.Sprint(b) {
+		t.Fatalf("two runs of the same workload differ:\n%+v\n%+v", a, b)
+	}
+}
+
 func TestRunDoesNotModifyItsInput(t *testing.T) {
 	w := workload(5, 200, 0.9)
 	before := clone(w)
@@ -115,6 +135,126 @@ func TestRunDoesNotModifyItsInput(t *testing.T) {
 			t.Fatalf("job %d was modified by Run", i)
 		}
 	}
+}
+
+// The properties below hold for every policy on random workloads that overload the cluster.
+func TestInvariantsOnRandomWorkloads(t *testing.T) {
+	q := quotas(sim.DefaultTeams())
+	configs := []struct {
+		name string
+		cfg  sched.Config
+	}{
+		{"fifo", sched.Config{Kind: sched.FIFO}},
+		{"backfill", sched.Config{Kind: sched.Backfill}},
+		{"fairshare", sched.Config{Kind: sched.FairShare, Quota: q, Preempt: true}},
+		{"fairshare-nopreempt", sched.Config{Kind: sched.FairShare, Quota: q}},
+		{"fairshare-twitchy", sched.Config{Kind: sched.FairShare, Quota: q, Preempt: true, MinRun: 1, MaxWait: 900, RestartCost: 5}},
+	}
+	total := spec.Nodes * spec.GPUsPerNode
+	for _, c := range configs {
+		for seed := int64(1); seed <= 6; seed++ {
+			t.Run(fmt.Sprintf("%s/seed%d", c.name, seed), func(t *testing.T) {
+				w := workload(seed, 500, 1.2)
+				team := map[int]string{}
+				prio := map[int]int{}
+				for _, j := range w {
+					team[j.ID], prio[j.ID] = j.Team, j.Priority
+				}
+				minRun := c.cfg.MinRun
+				if minRun <= 0 {
+					minRun = 300
+				}
+
+				usage := map[string]int{}
+				startedAt := map[int]float64{}
+				inUse, lastStart, last, busy := 0, -1, 0.0, 0.0
+				observe := func(ev sched.Event) {
+					j := ev.Job
+					busy += float64(inUse) * (ev.Time - last)
+					last = ev.Time
+					switch ev.Kind {
+					case sched.Start:
+						if c.cfg.Kind == sched.FIFO && j.ID < lastStart {
+							t.Fatalf("fifo started job %d after job %d", j.ID, lastStart)
+						}
+						lastStart = j.ID
+						startedAt[j.ID] = ev.Time
+						usage[j.Team] += j.GPUs()
+						inUse += j.GPUs()
+						if inUse > total {
+							t.Fatalf("t=%v: %d GPUs in use on a cluster of %d", ev.Time, inUse, total)
+						}
+					case sched.Finish:
+						usage[j.Team] -= j.GPUs()
+						inUse -= j.GPUs()
+					case sched.Preempt:
+						if !j.Preemptible {
+							t.Fatalf("t=%v: job %d is not preemptible", ev.Time, j.ID)
+						}
+						if ev.Time-startedAt[j.ID] < minRun {
+							t.Fatalf("t=%v: job %d preempted after %v s, MinRun is %v", ev.Time, j.ID, ev.Time-startedAt[j.ID], minRun)
+						}
+						if by := team[ev.For]; by != j.Team {
+							// The guarantee: another team only takes GPUs from a team above its quota.
+							if usage[j.Team] <= q[j.Team] {
+								t.Fatalf("t=%v: team %s runs %d GPUs, within its quota of %d, and lost job %d to team %s",
+									ev.Time, j.Team, usage[j.Team], q[j.Team], j.ID, by)
+							}
+						} else if prio[ev.For] <= j.Priority {
+							t.Fatalf("t=%v: job %d (priority %d) preempted job %d (priority %d) of the same team",
+								ev.Time, ev.For, prio[ev.For], j.ID, j.Priority)
+						}
+						usage[j.Team] -= j.GPUs()
+						inUse -= j.GPUs()
+					}
+				}
+
+				res, js, cl := sim.Replay(spec, c.cfg, w, observe)
+
+				useful, wasted := 0.0, 0.0
+				for _, j := range js {
+					if j.State != model.Done {
+						t.Fatalf("job %d ended %v, want done", j.ID, j.State)
+					}
+					if j.FirstStart < j.Submit-1e-9 || j.End < j.FirstStart+j.Runtime-1e-6 {
+						t.Fatalf("job %d: submit=%v first start=%v end=%v runtime=%v", j.ID, j.Submit, j.FirstStart, j.End, j.Runtime)
+					}
+					useful += j.Runtime * float64(j.GPUs())
+					wasted += j.WastedGPUs
+				}
+				if cl.Free() != cl.Total() || cl.Check() != nil {
+					t.Fatalf("cluster not empty at the end: free=%d of %d, check=%v", cl.Free(), cl.Total(), cl.Check())
+				}
+				if inUse != 0 || busy < 1 {
+					t.Fatalf("inUse=%d busy=%v at the end", inUse, busy)
+				}
+				// Every GPU-second in use is either finished work or work that a preemption wasted.
+				if want := useful + wasted; math.Abs(busy-want) > 1e-6*want {
+					t.Fatalf("busy GPU-seconds %.3f, finished work %.3f + wasted %.3f = %.3f", busy, useful, wasted, want)
+				}
+				if res.Preemptions != countPreemptions(js) {
+					t.Fatalf("result says %d preemptions, the jobs say %d", res.Preemptions, countPreemptions(js))
+				}
+				if c.cfg.Kind != sched.FairShare && res.ReservationViolations != 0 {
+					t.Fatalf("%d head jobs started after the time promised to them", res.ReservationViolations)
+				}
+				if !c.cfg.Preempt && res.Preemptions != 0 {
+					t.Fatalf("%d preemptions with preemption off", res.Preemptions)
+				}
+				if res.Utilization < 0 || res.Utilization > 1+1e-9 || res.UsefulUtilization > res.Utilization+1e-9 {
+					t.Fatalf("utilization %v, useful %v", res.Utilization, res.UsefulUtilization)
+				}
+			})
+		}
+	}
+}
+
+func countPreemptions(js []*model.Job) int {
+	n := 0
+	for _, j := range js {
+		n += j.Preemptions
+	}
+	return n
 }
 
 // Team b asks for both nodes at a lower priority than team a, which always has a one-node job
@@ -142,6 +282,24 @@ func TestAgingStopsAGangJobFromStarving(t *testing.T) {
 	}
 	if got := start(-1); got < 15000 {
 		t.Errorf("with aging off the gang job started at %v s: the scenario no longer starves it", got)
+	}
+}
+
+// The reason the policy exists: a team that stays within its quota keeps short waits while another
+// team floods the cluster, which plain backfill cannot promise.
+func TestFairShareProtectsTheTeamWithinItsQuota(t *testing.T) {
+	teams := sim.DefaultTeams()
+	back := sched.Config{Kind: sched.Backfill}
+	fair := sched.Config{Kind: sched.FairShare, Quota: quotas(teams), Preempt: true}
+	var pBack, pFair []float64
+	for seed := int64(1); seed <= 8; seed++ {
+		w := workload(seed, 3000, 0.85)
+		pBack = append(pBack, sim.Run(spec, back, w).TeamWaitP95["eval"])
+		pFair = append(pFair, sim.Run(spec, fair, w).TeamWaitP95["eval"])
+	}
+	b, f := mean(pBack), mean(pFair)
+	if f > 0.6*b {
+		t.Errorf("eval p95 wait: fairshare %.0f s, backfill %.0f s; want at most 60%% of backfill", f, b)
 	}
 }
 
@@ -177,5 +335,23 @@ func TestEmptyWorkload(t *testing.T) {
 	r := sim.Run(spec, sched.Config{Kind: sched.Backfill}, nil)
 	if r.Jobs != 0 || r.Makespan != 0 || r.Utilization != 0 {
 		t.Fatalf("empty workload gave %+v", r)
+	}
+}
+
+func mean(x []float64) float64 {
+	sort.Float64s(x)
+	s := 0.0
+	for _, v := range x {
+		s += v
+	}
+	return s / float64(len(x))
+}
+
+func BenchmarkRun3000Jobs(b *testing.B) {
+	w := workload(1, 3000, 0.85)
+	cfg := sched.Config{Kind: sched.FairShare, Quota: quotas(sim.DefaultTeams()), Preempt: true}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sim.Run(spec, cfg, w)
 	}
 }
