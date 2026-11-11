@@ -54,6 +54,12 @@ type Config struct {
 	// like Slurm's PreemptExemptTime). It also makes every Tick terminate: a job started or
 	// restarted during a Tick has run for zero seconds, so it cannot be preempted in that Tick.
 	MinRun float64
+	// MaxWait is how long a multi-node job may wait before FairShare serves it ahead of everything
+	// else, in order of arrival, whatever its quota and priority (default 6 h; negative turns it
+	// off). Without it a gang job can starve: it rarely fits its team's quota, and a reservation for
+	// it does not survive the arrival of a better-ranked job. Single-node jobs are not aged, they
+	// fit into gaps.
+	MaxWait float64
 	// RestartCost is the time in seconds, per GPU, that a preempted job spends restarting
 	// (scheduling, process start, checkpoint load) on top of the work it lost since its last
 	// checkpoint (default 120 s). It is added to the job's remaining time and to the wasted GPU-time.
@@ -111,6 +117,9 @@ func New(cfg Config, cl *model.Cluster) *Scheduler {
 	}
 	if cfg.MinRun <= 0 {
 		cfg.MinRun = 300
+	}
+	if cfg.MaxWait == 0 {
+		cfg.MaxWait = 6 * 3600
 	}
 	if cfg.RestartCost <= 0 {
 		cfg.RestartCost = 120
@@ -170,6 +179,7 @@ func (s *Scheduler) Submit(j *model.Job) error {
 		return fmt.Errorf("job %d asks for %d x %d GPUs, which this cluster can never provide", j.ID, j.Nodes, j.GPUsPerNode)
 	}
 	j.State = model.Pending
+	j.Queued = j.Submit
 	j.Remaining = j.Runtime
 	j.FirstStart = -1
 	s.insertPending(j)
@@ -240,10 +250,11 @@ func (s *Scheduler) accrue(now float64) {
 	s.lastTick = now
 }
 
-// ordered returns the pending jobs in the order the policy wants to serve them. FairShare puts the
-// jobs that fit their team's quota first, then orders by priority, then by decayed usage divided by
-// quota (the team that has used the least of its share goes first), then by arrival.
-func (s *Scheduler) ordered() []*model.Job {
+// ordered returns the pending jobs in the order the policy wants to serve them. FairShare serves
+// first the jobs that have waited MaxWait (oldest first), then the jobs that fit their team's
+// quota, then orders by priority, then by decayed usage divided by quota (the team that has used
+// the least of its share goes first), then by arrival.
+func (s *Scheduler) ordered(now float64) []*model.Job {
 	q := append([]*model.Job(nil), s.pending...)
 	if s.cfg.Kind != FairShare {
 		return q
@@ -251,6 +262,7 @@ func (s *Scheduler) ordered() []*model.Job {
 	run := s.RunningByTeam()
 	type ranked struct {
 		j    *model.Job
+		aged bool
 		over bool
 		norm float64
 	}
@@ -259,12 +271,22 @@ func (s *Scheduler) ordered() []*model.Job {
 		quota := float64(s.cfg.Quota[j.Team])
 		r[i] = ranked{
 			j:    j,
+			aged: s.cfg.MaxWait > 0 && j.Nodes > 1 && now-j.Queued >= s.cfg.MaxWait,
 			over: run[j.Team]+j.GPUs() > s.cfg.Quota[j.Team],
 			norm: s.usage[j.Team] / math.Max(1, quota),
 		}
 	}
 	sort.Slice(r, func(a, b int) bool {
 		x, y := r[a], r[b]
+		if x.aged != y.aged {
+			return x.aged
+		}
+		if x.aged {
+			if x.j.Queued != y.j.Queued {
+				return x.j.Queued < y.j.Queued
+			}
+			return x.j.ID < y.j.ID
+		}
 		if x.over != y.over {
 			return !x.over
 		}
@@ -286,7 +308,7 @@ func (s *Scheduler) step(now float64) bool {
 	if len(s.pending) == 0 {
 		return false
 	}
-	q := s.ordered()
+	q := s.ordered(now)
 	head := q[0]
 	if s.tryStart(head, now) {
 		return true

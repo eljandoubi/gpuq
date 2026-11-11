@@ -376,6 +376,25 @@ func TestPreemptsOnlyTheJobsThatFreeAWholeNode(t *testing.T) {
 	}
 }
 
+// An aged gang job heads the queue and cannot start; the team with a guaranteed share behind it
+// must still get its GPUs back.
+func TestAQuotaReclaimDoesNotWaitBehindAnAgedGang(t *testing.T) {
+	cfg := fairShare(map[string]int{"r": 4, "e": 4})
+	cfg.MaxWait = 100
+	s := sched.New(cfg, cluster(2, 4))
+	r1, r2 := job(1, "r", 1, 4, 9000), job(2, "r", 1, 4, 9000)
+	r1.Preemptible, r2.Preemptible = true, true
+	gang := job(3, "r", 2, 4, 100)
+	submit(t, s, 0, r1, r2, gang)
+	s.Drain()
+	e1 := job(4, "e", 1, 4, 100)
+	submit(t, s, 500, e1)
+	if e1.State != model.Running || r2.State != model.Pending || gang.State != model.Pending {
+		t.Fatalf("e1=%v r2=%v gang=%v: e1 is within its quota and must reclaim a node even though the aged gang is ahead",
+			e1.State, r2.State, gang.State)
+	}
+}
+
 // Only the head and the jobs that fit their team's quota may start a preemption. The urgent job
 // behind them waits, even though it outranks the borrowers it could take GPUs from.
 func TestOnlyGuaranteedJobsAndTheHeadStartAPreemption(t *testing.T) {

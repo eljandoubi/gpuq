@@ -117,6 +117,34 @@ func TestRunDoesNotModifyItsInput(t *testing.T) {
 	}
 }
 
+// Team b asks for both nodes at a lower priority than team a, which always has a one-node job
+// ready. Without aging the gang job waits for the whole stream; with aging it waits about MaxWait
+// plus the time to drain the two nodes.
+func TestAgingStopsAGangJobFromStarving(t *testing.T) {
+	two := sim.Spec{Nodes: 2, GPUsPerNode: 8, NodesPerRack: 2}
+	jobs := []*model.Job{{ID: 1, Team: "b", Priority: 0, Nodes: 2, GPUsPerNode: 8, Runtime: 100, Submit: 10}}
+	for i := 0; i < 400; i++ {
+		jobs = append(jobs, &model.Job{ID: i + 2, Team: "a", Priority: 1, Nodes: 1, GPUsPerNode: 8, Runtime: 100, Submit: float64(50 * i)})
+	}
+	start := func(maxWait float64) float64 {
+		cfg := sched.Config{Kind: sched.FairShare, Quota: map[string]int{"a": 16}, MaxWait: maxWait}
+		_, js, _ := sim.RunDetailed(two, cfg, jobs)
+		for _, j := range js {
+			if j.ID == 1 {
+				return j.FirstStart
+			}
+		}
+		t.Fatal("job 1 vanished")
+		return 0
+	}
+	if got := start(300); got > 600 {
+		t.Errorf("with MaxWait=300 s the gang job started at %v s, want before 600 s", got)
+	}
+	if got := start(-1); got < 15000 {
+		t.Errorf("with aging off the gang job started at %v s: the scenario no longer starves it", got)
+	}
+}
+
 func TestResultMetricsOnATinyWorkload(t *testing.T) {
 	two := sim.Spec{Nodes: 1, GPUsPerNode: 4, NodesPerRack: 1}
 	jobs := []*model.Job{

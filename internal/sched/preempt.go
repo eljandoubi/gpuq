@@ -139,6 +139,7 @@ func (s *Scheduler) preempt(v *model.Job, now float64, forID int) {
 	}
 	delete(s.running, v.ID)
 	v.State = model.Pending
+	v.Queued = now
 	v.Placement = nil
 	v.Preemptions++
 	v.Gen++
