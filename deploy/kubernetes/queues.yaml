@@ -1,0 +1,142 @@
+# gpuq's default teams (research 24, training 32, eval 8 GPUs = 64) as Kueue queues.
+# Schema-checked with kubeconform (see deploy/README.md); not applied to a live cluster.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: gpu-node
+spec:
+  nodeLabels:
+    gpuq.example.org/pool: gpu
+---
+# Higher value = served first and may preempt lower values (gpuq: Job.Priority 0, 1, 2).
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: batch
+value: 0
+description: Preemptible batch work.
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: normal
+value: 100
+description: Default priority.
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: urgent
+value: 200
+description: Short, interactive or protected work.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: research
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: training
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: research
+spec:
+  cohort: gpu-cluster            # the three queues share idle GPUs: borrowing
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: research
+  queueingStrategy: BestEffortFIFO   # a job that does not fit does not block the ones behind it
+  preemption:
+    reclaimWithinCohort: Any         # take back GPUs lent to other queues
+    withinClusterQueue: LowerPriority
+    borrowWithinCohort:
+      policy: LowerPriority          # a higher-priority job may preempt lower-priority borrowers
+      maxPriorityThreshold: 100
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: gpu-node
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: 24
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: training
+spec:
+  cohort: gpu-cluster
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: training
+  queueingStrategy: BestEffortFIFO
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
+    borrowWithinCohort:
+      policy: LowerPriority
+      maxPriorityThreshold: 100
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: gpu-node
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: 32
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: eval
+spec:
+  cohort: gpu-cluster
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: eval
+  queueingStrategy: BestEffortFIFO
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
+    borrowWithinCohort:
+      policy: LowerPriority
+      maxPriorityThreshold: 100
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: gpu-node
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: 8
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: main
+  namespace: research
+spec:
+  clusterQueue: research
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: main
+  namespace: training
+spec:
+  clusterQueue: training
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: main
+  namespace: eval
+spec:
+  clusterQueue: eval

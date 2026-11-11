@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpuq-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpuqd
+  namespace: gpuq-system
+automountServiceAccountToken: false
+---
+# The daemon keeps its state in memory: one replica, and a restart forgets the queue.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpuqd
+  namespace: gpuq-system
+  labels:
+    app.kubernetes.io/name: gpuqd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpuqd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gpuqd
+      annotations:
+        # Datadog Agent: scrape the Prometheus endpoint with the OpenMetrics check (Autodiscovery
+        # annotation in the format of Datadog's OpenMetrics integration docs).
+        ad.datadoghq.com/gpuqd.checks: |
+          {"openmetrics": {"init_config": {}, "instances": [{"openmetrics_endpoint": "http://%%host%%:8080/metrics", "namespace": "gpuq", "metrics": ["gpuq_.*"]}]}}
+    spec:
+      serviceAccountName: gpuqd
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gpuqd
+          image: gpuq:dev            # build with the Dockerfile at the root of the repository
+          imagePullPolicy: IfNotPresent
+          args:
+            - -addr=:8080
+            - -policy=fairshare
+            - -quota=research=24,training=32,eval=8
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpuqd
+  namespace: gpuq-system
+  labels:
+    app.kubernetes.io/name: gpuqd
+spec:
+  selector:
+    app.kubernetes.io/name: gpuqd
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

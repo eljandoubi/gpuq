@@ -1,0 +1,56 @@
+# Two workloads for the queues in queues.yaml. Kueue admits a Job as one unit: all its pods fit the
+# quota or none starts, which is the gang semantics gpuq models.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-smoke
+  namespace: eval
+  labels:
+    kueue.x-k8s.io/queue-name: main
+    kueue.x-k8s.io/priority-class: urgent
+spec:
+  suspend: true                # Kueue starts it when the quota allows
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          image: nvidia/cuda:12.4.1-base-ubuntu22.04
+          command: ["nvidia-smi"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              nvidia.com/gpu: 1
+---
+# A 4-node x 8-GPU gang (32 GPUs: all four pods are admitted together or not at all). The training
+# queue has 32 GPUs of its own, so it needs no borrowing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-4x8
+  namespace: training
+  labels:
+    kueue.x-k8s.io/queue-name: main
+    kueue.x-k8s.io/priority-class: normal
+spec:
+  suspend: true
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: nvcr.io/nvidia/pytorch:24.10-py3
+          command: ["torchrun", "--nnodes=4", "--nproc-per-node=8", "train.py"]
+          resources:
+            requests:
+              cpu: "32"
+              memory: 256Gi
+            limits:
+              nvidia.com/gpu: 8

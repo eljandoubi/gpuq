@@ -42,3 +42,18 @@ jobs:
           curl -fsS localhost:8080/v1/jobs -d '{"team":"a","nodes":1,"gpus_per_node":4,"runtime_s":60}'
           curl -fsS localhost:8080/metrics | grep '^gpuq_jobs_running 1'
           docker logs gpuqd
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: kubeconform
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@latest
+          "$(go env GOPATH)/bin/kubeconform" -strict -summary -kubernetes-version 1.30.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            deploy/kubernetes/

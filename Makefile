@@ -1,4 +1,4 @@
-.PHONY: all build test race bench lint sim sweep mutate
+.PHONY: all build test race bench lint sim sweep mutate k8s-validate
 
 all: lint race
 
@@ -28,3 +28,9 @@ sweep:
 # Every hand-written mutant of the scheduler must be caught by the tests.
 mutate:
 	python3 scripts/mutate.py
+
+# Schema-check the Kubernetes and Kueue manifests (needs kubeconform on the PATH).
+k8s-validate:
+	kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default \
+	  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+	  deploy/kubernetes/
